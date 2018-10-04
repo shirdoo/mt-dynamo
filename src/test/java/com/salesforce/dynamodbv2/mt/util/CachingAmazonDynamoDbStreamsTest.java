@@ -414,14 +414,6 @@ class CachingAmazonDynamoDbStreamsTest {
                 .withStreamArn(streamArn)
                 .withShardId(shardId)
                 .withShardIteratorType(ShardIteratorType.AFTER_SEQUENCE_NUMBER)));
-
-        // invalid sequence number (not a number)
-        assertThrows(IllegalArgumentException.class,
-            () -> cachingStreams.getShardIterator(new GetShardIteratorRequest()
-                .withStreamArn(streamArn)
-                .withShardId(shardId)
-                .withShardIteratorType(ShardIteratorType.AFTER_SEQUENCE_NUMBER)
-                .withSequenceNumber("a")));
     }
 
     /**

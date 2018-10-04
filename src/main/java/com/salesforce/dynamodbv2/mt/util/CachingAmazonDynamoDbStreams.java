@@ -21,7 +21,10 @@ import com.amazonaws.services.dynamodbv2.model.ShardIteratorType;
 import com.amazonaws.services.dynamodbv2.model.StreamRecord;
 import com.salesforce.dynamodbv2.mt.mappers.DelegatingAmazonDynamoDbStreams;
 import java.math.BigInteger;
+import java.util.AbstractMap.SimpleImmutableEntry;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -34,6 +37,8 @@ import java.util.TreeMap;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.BiFunction;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
@@ -165,19 +170,83 @@ public class CachingAmazonDynamoDbStreams extends DelegatingAmazonDynamoDbStream
     }
 
     /**
-     * An absolute position in a stream expressed as a triple of streamArn, shardId, and sequence number. Note: there is
-     * no guarantee that there is actually a record at the given position in the stream.
+     * Unique identifier of a shard that consists of streamArn and shardUid.
      */
-    private static final class IteratorPosition implements Comparable<IteratorPosition>, Predicate<Record> {
+    private static final class ShardUid {
 
         private final String streamArn;
         private final String shardId;
-        private final BigInteger sequenceNumber;
 
-        IteratorPosition(String streamArn, String shardId, BigInteger sequenceNumber) {
+        private ShardUid(String streamArn, String shardId) {
             this.streamArn = checkNotNull(streamArn);
             this.shardId = checkNotNull(shardId);
-            this.sequenceNumber = checkNotNull(sequenceNumber);
+        }
+
+        /**
+         * Returns the position immediately following the last record in the given result.
+         *
+         * @param result Result to position after. Record list must not be empty.
+         * @return IteratorPosition immediately following the last record sequence number in the result.
+         */
+        IteratorPosition nextIteratorPosition(GetRecordsResult result) {
+            assert !result.getRecords().isEmpty();
+            return new IteratorPosition(this, SequenceNumber.fromRecord(getLast(result.getRecords())).next());
+        }
+
+        /**
+         * Returns a shard iterator that starts after the last record in the given result.
+         *
+         * @param result Result to position the iterator after. Record list must not be empty.
+         * @param dynamoDbIterator Optional DynamoDB-level iterator after the last record.
+         * @return ShardIterator that is positioned after the given result.
+         */
+        ShardIterator nextShardIterator(GetRecordsResult result, @Nullable String dynamoDbIterator) {
+            assert !result.getRecords().isEmpty();
+            return new ShardIterator(streamArn, shardId, AFTER_SEQUENCE_NUMBER,
+                getLast(result.getRecords()).getDynamodb().getSequenceNumber(), dynamoDbIterator);
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            ShardUid that = (ShardUid) o;
+            return Objects.equals(streamArn, that.streamArn) && Objects.equals(shardId, that.shardId);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(streamArn, shardId);
+        }
+    }
+
+    /**
+     * A wrapper around a DynamoDB sequence number that facilitates comparison.
+     */
+    private static final class SequenceNumber implements Comparable<SequenceNumber>, Predicate<Record> {
+
+        static SequenceNumber fromRecord(Record record) {
+            checkNotNull(record);
+            return fromValue(record.getDynamodb().getSequenceNumber());
+        }
+
+        static SequenceNumber fromValue(String sequenceNumber) {
+            checkNotNull(sequenceNumber);
+            try {
+                return new SequenceNumber(new BigInteger(sequenceNumber));
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException(e);
+            }
+        }
+
+        private final BigInteger value;
+
+        private SequenceNumber(BigInteger value) {
+            this.value = value;
         }
 
         /**
@@ -199,7 +268,7 @@ public class CachingAmazonDynamoDbStreams extends DelegatingAmazonDynamoDbStream
          * @return true if the sequence number of the record is greater or equal to the position sequence number.
          */
         boolean precedes(Record record) {
-            return sequenceNumber.compareTo(parseSequenceNumber(record)) <= 0;
+            return this.compareTo(fromRecord(record)) <= 0;
         }
 
         /**
@@ -215,75 +284,73 @@ public class CachingAmazonDynamoDbStreams extends DelegatingAmazonDynamoDbStream
         }
 
         /**
+         * Returns the next sequence number after this one.
+         *
+         * @return Next sequence number.
+         */
+        SequenceNumber next() {
+            return new SequenceNumber(value.add(ONE));
+        }
+
+        /**
+         * Compares the given sequence number with this one based on their numerical values.
+         *
+         * @param o Other sequence number.
+         * @return negative integer, zero, or positive integer as this object is less than, equal to, or greater than.
+         */
+        @Override
+        public int compareTo(SequenceNumber o) {
+            return value.compareTo(o.value);
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            SequenceNumber that = (SequenceNumber) o;
+            return Objects.equals(value, that.value);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(value);
+        }
+
+    }
+
+    /**
+     * An absolute position in a stream expressed as a triple of streamArn, shardUid, and sequence number. Note: there
+     * is no guarantee that there is actually a record at the given position in the stream.
+     */
+    private static final class IteratorPosition {
+
+        final ShardUid shardUid;
+        final SequenceNumber sequenceNumber;
+
+        IteratorPosition(ShardUid shardUid, SequenceNumber sequenceNumber) {
+            this.shardUid = checkNotNull(shardUid);
+            this.sequenceNumber = checkNotNull(sequenceNumber);
+        }
+
+        /**
          * Returns the position immediately following this one, i.e., the next sequence number in the same stream
          * shard.
          *
          * @return Next iterator position.
          */
         IteratorPosition next() {
-            return new IteratorPosition(streamArn, shardId, sequenceNumber.add(ONE));
-        }
-
-        /**
-         * Returns the position immediately following the last record in the given result.
-         *
-         * @param result Result to position after. Record list must not be empty.
-         * @return IteratorPosition immediately following the last record sequence number in the result.
-         */
-        IteratorPosition next(GetRecordsResult result) {
-            assert !result.getRecords().isEmpty();
-            return new IteratorPosition(streamArn, shardId, parseSequenceNumber(getLast(result.getRecords()))).next();
-        }
-
-        /**
-         * Returns a shard iterator that starts after the last record in the given result.
-         *
-         * @param result Result to position the iterator after. Record list must not be empty.
-         * @param dynamoDbIterator Optional DynamoDB-level iterator after the last record.
-         * @return ShardIterator that is positioned after the given result.
-         */
-        ShardIterator nextShardIterator(GetRecordsResult result, @Nullable String dynamoDbIterator) {
-            assert !result.getRecords().isEmpty();
-            return new ShardIterator(streamArn, shardId, AFTER_SEQUENCE_NUMBER,
-                getLast(result.getRecords()).getDynamodb().getSequenceNumber(), dynamoDbIterator);
-        }
-
-        /**
-         * Compares the given position to this position. Sorts positions in different stream shards lexicographically by
-         * their streamArn and shardId. Within a given stream shard, positions are sorted numerically by their sequence
-         * number.
-         *
-         * @param o Other position.
-         * @return negative integer, zero, or positive integer as this position is less than, equal, or greater other.
-         */
-        @Override
-        public int compareTo(@Nonnull IteratorPosition o) {
-            int c = streamArn.compareTo(o.streamArn);
-            if (c != 0) {
-                return c;
-            }
-            c = shardId.compareTo(o.shardId);
-            if (c != 0) {
-                return c;
-            }
-            return sequenceNumber.compareTo(o.sequenceNumber);
-        }
-
-        /**
-         * Checks whether the given iterator position has the same streamArn and shardId.
-         *
-         * @param o Other iterator position.
-         * @return true if the other iterator position has the same same streamArn and shardId, false otherwise.
-         */
-        boolean equalsShard(IteratorPosition o) {
-            return streamArn.equals(o.streamArn) && shardId.equals(o.shardId);
+            return new IteratorPosition(shardUid, sequenceNumber.next());
         }
 
         /**
          * Checks given object for equality.
          *
          * @param o Other object.
-         * @return True if the given object is an IteratorPosition with the same streamArn, shardId, and sequenceNumber.
+         * @return True if the given object is an IteratorPosition with equal streamArn, shardUid, and sequenceNumber.
          */
         @Override
         public boolean equals(Object o) {
@@ -294,26 +361,23 @@ public class CachingAmazonDynamoDbStreams extends DelegatingAmazonDynamoDbStream
                 return false;
             }
             IteratorPosition that = (IteratorPosition) o;
-            return Objects.equals(streamArn, that.streamArn)
-                && Objects.equals(shardId, that.shardId)
-                && Objects.equals(sequenceNumber, that.sequenceNumber);
+            return Objects.equals(shardUid, that.shardUid) && Objects.equals(sequenceNumber, that.sequenceNumber);
         }
 
         /**
-         * Hash code of this iterator position including streamArn, shardId, and sequence number.
+         * Hash code of this iterator position including streamArn, shardUid, and sequence number.
          *
          * @return Hash code.
          */
         @Override
         public int hashCode() {
-            return Objects.hash(streamArn, shardId, sequenceNumber);
+            return Objects.hash(shardUid, sequenceNumber);
         }
-
     }
 
-
     /**
-     * A logical shard iterator that optionally wraps an underlying DynamoDB iterator.
+     * A logical shard iterator that optionally wraps an underlying DynamoDB iterator. This class is used to serialize,
+     * deserialize, and load shard iterators and to resolve iterator positions. It is not used as a cache key.
      */
     private static final class ShardIterator {
 
@@ -384,8 +448,6 @@ public class CachingAmazonDynamoDbStreams extends DelegatingAmazonDynamoDbStream
         @Nullable
         private final String sequenceNumber;
         @Nullable
-        private final BigInteger parsedSequenceNumber;
-        @Nullable
         private String dynamoDbIterator;
 
         private ShardIterator(
@@ -397,24 +459,21 @@ public class CachingAmazonDynamoDbStreams extends DelegatingAmazonDynamoDbStream
             this.streamArn = checkNotNull(streamArn);
             this.shardId = checkNotNull(shardId);
             this.type = type;
-            this.dynamoDbIterator = dynamoDbIterator;
-
             switch (type) {
                 case TRIM_HORIZON:
                 case LATEST:
                     checkArgument(sequenceNumber == null);
                     this.sequenceNumber = null;
-                    this.parsedSequenceNumber = null;
                     break;
                 case AT_SEQUENCE_NUMBER:
                 case AFTER_SEQUENCE_NUMBER:
                     checkArgument(sequenceNumber != null);
                     this.sequenceNumber = sequenceNumber;
-                    this.parsedSequenceNumber = parseSequenceNumber(sequenceNumber);
                     break;
                 default:
                     throw new RuntimeException("Missing case statement for ShardIteratorType");
             }
+            this.dynamoDbIterator = dynamoDbIterator;
         }
 
         /**
@@ -461,9 +520,11 @@ public class CachingAmazonDynamoDbStreams extends DelegatingAmazonDynamoDbStream
                 case LATEST:
                     return Optional.empty();
                 case AT_SEQUENCE_NUMBER:
-                    return Optional.of(new IteratorPosition(streamArn, shardId, parsedSequenceNumber));
+                    return Optional.of(new IteratorPosition(new ShardUid(streamArn, shardId),
+                        SequenceNumber.fromValue(sequenceNumber)));
                 case AFTER_SEQUENCE_NUMBER:
-                    return Optional.of(new IteratorPosition(streamArn, shardId, parsedSequenceNumber.add(ONE)));
+                    return Optional.of(new IteratorPosition(new ShardUid(streamArn, shardId),
+                        SequenceNumber.fromValue(sequenceNumber).next()));
                 default:
                     throw new RuntimeException("Unhandled switch case");
             }
@@ -480,7 +541,8 @@ public class CachingAmazonDynamoDbStreams extends DelegatingAmazonDynamoDbStream
         IteratorPosition resolvePosition(List<Record> records) {
             assert !records.isEmpty();
             return resolvePosition()
-                .orElseGet(() -> new IteratorPosition(streamArn, shardId, parseSequenceNumber(records.get(0))));
+                .orElseGet(() -> new IteratorPosition(new ShardUid(streamArn, shardId),
+                    SequenceNumber.fromRecord(records.get(0))));
         }
 
         /**
@@ -549,30 +611,6 @@ public class CachingAmazonDynamoDbStreams extends DelegatingAmazonDynamoDbStream
     static final int GET_RECORDS_LIMIT = 1000;
 
     /**
-     * Parses the given string representation of a DynamoDB sequence number into a BigInteger.
-     *
-     * @param sequenceNumber String representation of sequence number.
-     * @return BigInteger value.
-     */
-    private static BigInteger parseSequenceNumber(String sequenceNumber) {
-        try {
-            return new BigInteger(sequenceNumber);
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException(e);
-        }
-    }
-
-    /**
-     * Parses the sequence number of the given record into a BigInteger.
-     *
-     * @param record Record with sequence number.
-     * @return BigInteger sequence number value.
-     */
-    private static BigInteger parseSequenceNumber(Record record) {
-        return parseSequenceNumber(record.getDynamodb().getSequenceNumber());
-    }
-
-    /**
      * Returns a shortened string representation of the given GetRecordsResult intended for debug logs that doesn't
      * include individual records.
      *
@@ -599,7 +637,7 @@ public class CachingAmazonDynamoDbStreams extends DelegatingAmazonDynamoDbStream
     // cache for quasi-immutable values that maintains insertion order for LRU removal
     private final Map<IteratorPosition, GetRecordsResult> recordsCache;
     // index on position for efficient position-based cache lookups
-    private final NavigableMap<IteratorPosition, GetRecordsResult> recordsCacheIndex;
+    private final Map<ShardUid, NavigableMap<SequenceNumber, GetRecordsResult>> recordsCacheIndex;
     // looks for mutating lock
     private final ReadWriteLock recordsCacheLock;
     // size of cache >= 0
@@ -625,7 +663,7 @@ public class CachingAmazonDynamoDbStreams extends DelegatingAmazonDynamoDbStream
                 return false;
             }
         };
-        this.recordsCacheIndex = new TreeMap<>();
+        this.recordsCacheIndex = new HashMap<>();
         this.recordsCacheByteSize = 0L;
         this.recordsCacheLock = new ReentrantReadWriteLock();
     }
@@ -817,12 +855,12 @@ public class CachingAmazonDynamoDbStreams extends DelegatingAmazonDynamoDbStream
                 if (position.equals(previousPosition)) {
                     // exact iterator hit (hopefully common case), return all cached records
                     cachedRecordsResult = Optional.of(previousResult);
-                } else if (position.equalsShard(previousPosition) && position.precedesAny(previousResult)) {
+                } else if (position.sequenceNumber.precedesAny(previousResult)) {
                     // Cache entry contains records that match (i.e., come after) the requested iterator
                     // position: Filter cached records to those that match. Return only that subset, to increase
                     // the chance of using a shared iterator position on the next getRecords call.
                     final List<Record> matchingCachedRecords = previousResult.getRecords().stream()
-                        .filter(position)
+                        .filter(position.sequenceNumber)
                         .collect(toList());
                     return Optional.of(new GetRecordsResult()
                         .withRecords(matchingCachedRecords)
@@ -857,19 +895,20 @@ public class CachingAmazonDynamoDbStreams extends DelegatingAmazonDynamoDbStream
             IteratorPosition cachePosition = loadedPosition;
             GetRecordsResult cacheResult = new GetRecordsResult().withRecords(loadedResult.getRecords());
             Optional.ofNullable(loadedResult.getNextShardIterator())
-                .map(nextIterator -> loadedPosition.nextShardIterator(loadedResult, nextIterator).toExternalString())
+                .map(nextIterator -> loadedPosition.shardUid.nextShardIterator(loadedResult, nextIterator)
+                    .toExternalString())
                 .ifPresent(cacheResult::setNextShardIterator);
 
             boolean predecessorAdjacent = false;
             final Entry<IteratorPosition, GetRecordsResult> predecessor = getFloorCacheEntry(loadedPosition);
-            if (predecessor != null && loadedPosition.equalsShard(predecessor.getKey())) {
+            if (predecessor != null) {
                 GetRecordsResult predecessorResult = predecessor.getValue();
-                if (loadedPosition.precedesAny(predecessorResult)) {
+                if (loadedPosition.sequenceNumber.precedesAny(predecessorResult)) {
                     // the previous cache entry overlaps with the records we retrieved: filter out overlapping records
                     // (by reducing the loaded records to those that come after the last predecessor record)
-                    cachePosition = loadedPosition.next(predecessorResult);
+                    cachePosition = loadedPosition.shardUid.nextIteratorPosition(predecessorResult);
                     cacheResult.setRecords(cacheResult.getRecords().stream()
-                        .filter(cachePosition)
+                        .filter(cachePosition.sequenceNumber)
                         .collect(toList()));
                     // if all retrieved records are contained in the predecessor, we have nothing to add
                     if (cacheResult.getRecords().isEmpty()) {
@@ -878,19 +917,20 @@ public class CachingAmazonDynamoDbStreams extends DelegatingAmazonDynamoDbStream
                     predecessorAdjacent = true;
                 } else {
                     //
-                    predecessorAdjacent = loadedPosition.equals(loadedPosition.next(predecessorResult));
+                    predecessorAdjacent = loadedPosition
+                        .equals(loadedPosition.shardUid.nextIteratorPosition(predecessorResult));
                 }
             }
 
             boolean successorAdjacent = false;
             final Entry<IteratorPosition, GetRecordsResult> successor = getHigherCacheEntry(cachePosition);
-            if (successor != null && cachePosition.equalsShard(successor.getKey())) {
+            if (successor != null) {
                 IteratorPosition successorPosition = successor.getKey();
-                if (successorPosition.precedesAny(cacheResult)) {
+                if (successorPosition.sequenceNumber.precedesAny(cacheResult)) {
                     // the succeeding cache entry overlaps with loaded records: filter out overlapping records
                     // (by reducing the loaded records to those that come before the successor starting position)
                     cacheResult.setRecords(cacheResult.getRecords().stream()
-                        .filter(successorPosition.negate())
+                        .filter(successorPosition.sequenceNumber.negate())
                         .collect(toList()));
 
                     if (cacheResult.getRecords().isEmpty()) {
@@ -901,11 +941,12 @@ public class CachingAmazonDynamoDbStreams extends DelegatingAmazonDynamoDbStream
                     } else {
                         // if some of the retrieved records are not contained in the next segment,
                         cacheResult.setNextShardIterator(
-                            cachePosition.nextShardIterator(cacheResult, null).toExternalString());
+                            cachePosition.shardUid.nextShardIterator(cacheResult, null).toExternalString());
                         successorAdjacent = true;
                     }
                 } else {
-                    successorAdjacent = successorPosition.equals(cachePosition.next(cacheResult));
+                    successorAdjacent = successorPosition
+                        .equals(cachePosition.shardUid.nextIteratorPosition(cacheResult));
                 }
             }
 
@@ -943,7 +984,9 @@ public class CachingAmazonDynamoDbStreams extends DelegatingAmazonDynamoDbStream
     private void addCacheEntry(IteratorPosition key, GetRecordsResult value) {
         GetRecordsResult previous = recordsCache.put(key, value);
         assert previous == null;
-        previous = recordsCacheIndex.put(key, value);
+        NavigableMap<SequenceNumber, GetRecordsResult> shardCache = recordsCacheIndex
+            .computeIfAbsent(key.shardUid, k -> new TreeMap<>());
+        previous = shardCache.put(key.sequenceNumber, value);
         assert previous == null;
         recordsCacheByteSize += getByteSize(value);
     }
@@ -955,8 +998,14 @@ public class CachingAmazonDynamoDbStreams extends DelegatingAmazonDynamoDbStream
     }
 
     private void removedCacheEntry(Entry<IteratorPosition, GetRecordsResult> entry) {
-        GetRecordsResult value = recordsCacheIndex.remove(entry.getKey());
-        assert value == entry.getValue();
+        IteratorPosition key = entry.getKey();
+        NavigableMap<SequenceNumber, GetRecordsResult> shardCache = recordsCacheIndex.get(key.shardUid);
+        assert !shardCache.isEmpty();
+        GetRecordsResult value = shardCache.remove(key.sequenceNumber);
+        assert value != null;
+        if (shardCache.isEmpty()) {
+            recordsCacheIndex.remove(key.shardUid);
+        }
         recordsCacheByteSize -= getByteSize(entry.getValue());
         assert recordsCacheByteSize >= 0;
     }
@@ -966,11 +1015,25 @@ public class CachingAmazonDynamoDbStreams extends DelegatingAmazonDynamoDbStream
     }
 
     private Entry<IteratorPosition, GetRecordsResult> getFloorCacheEntry(IteratorPosition position) {
-        return recordsCacheIndex.floorEntry(position);
+        return getCacheEntry(NavigableMap::floorEntry, position);
     }
 
     private Entry<IteratorPosition, GetRecordsResult> getHigherCacheEntry(IteratorPosition position) {
-        return recordsCacheIndex.higherEntry(position);
+        return getCacheEntry(NavigableMap::higherEntry, position);
+    }
+
+    private Entry<IteratorPosition, GetRecordsResult> getCacheEntry(
+        BiFunction<NavigableMap<SequenceNumber, GetRecordsResult>, SequenceNumber, Entry<SequenceNumber, GetRecordsResult>> getEntry,
+        IteratorPosition position) {
+        NavigableMap<SequenceNumber, GetRecordsResult> shardCache = recordsCacheIndex.get(position.shardUid);
+        if (shardCache == null) {
+            return null;
+        }
+        Entry<SequenceNumber, GetRecordsResult> entry = getEntry.apply(shardCache, position.sequenceNumber);
+        if (entry == null) {
+            return null;
+        }
+        return new SimpleImmutableEntry<>(new IteratorPosition(position.shardUid, entry.getKey()), entry.getValue());
     }
 
 }
