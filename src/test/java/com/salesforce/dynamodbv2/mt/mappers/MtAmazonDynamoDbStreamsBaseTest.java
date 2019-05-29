@@ -99,6 +99,13 @@ public class MtAmazonDynamoDbStreamsBaseTest {
                 .withStreamViewType(NEW_AND_OLD_IMAGES));
     }
 
+    /**
+     * Test utility method.
+     */
+    protected static CreateTableRequest newCreateTableRequestWithoutStreams(String tableName, boolean binaryHashKey) {
+        return newCreateTableRequest(tableName, binaryHashKey).withStreamSpecification(new StreamSpecification().withStreamEnabled(false));
+    }
+
     protected static void createTenantTables(AmazonDynamoDB mtDynamoDb) {
         for (String tenant : TENANTS) {
             MT_CONTEXT.withContext(tenant, () -> mtDynamoDb.createTable(newCreateTableRequest(
@@ -288,13 +295,15 @@ public class MtAmazonDynamoDbStreamsBaseTest {
         try {
             // create tenant tables and test data
             createTenantTables(mtDynamoDb);
-            final Collection<MtRecord> expected = new ArrayList<>(4);
-            int i = 0;
-            expected.add(putTestItem(mtDynamoDb, TENANTS[0], i++));
-            expected.add(putTestItem(mtDynamoDb, TENANTS[0], i));
-            i = 0;
-            expected.add(putTestItem(mtDynamoDb, TENANTS[1], i++));
-            expected.add(putTestItem(mtDynamoDb, TENANTS[1], i));
+            String nonStreamTenant = "tenant3";
+            MT_CONTEXT.withContext(nonStreamTenant, () -> mtDynamoDb.createTable(newCreateTableRequestWithoutStreams(
+                TENANT_TABLE_NAME, false)));
+            final Collection<MtRecord> expected = new ArrayList<>(6);
+            for (int i = 0; i < 2; i++) {
+                expected.add(putTestItem(mtDynamoDb, TENANTS[0], i));
+                expected.add(putTestItem(mtDynamoDb, TENANTS[1], i));
+                expected.add(putTestItem(mtDynamoDb, nonStreamTenant, i));
+            }
 
             List<Stream> streams = mtDynamoDbStreams.listStreams(new ListStreamsRequest()).getStreams();
 
